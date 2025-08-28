@@ -33,30 +33,37 @@ interface QueueMiddlewareOptions {
    * Set to 0 for unlimited queue size.
    */
   queueLimit: number
-  
+
   /** 
    * How many requests can be processed simultaneously.
    * Defaults to 1 (sequential processing).
    */
   concurrency?: number
-  
+
   /** 
    * Custom handler called when the queue is full.
    * Should return a Response object (typically with status 429).
    */
   onQueueFull?: (context: Context) => Response | Promise<Response>
-  
+
   /** 
    * Custom handler called when a request times out while waiting.
    * Should return a Response object (typically with status 408).
    */
   onQueueTimeout?: (context: Context) => Response | Promise<Response>
-  
+
   /** 
    * How long a request can wait in the queue before timing out (in milliseconds).
    * Defaults to 30000ms (30 seconds). Set to 0 to disable timeouts.
    */
   timeout?: number
+
+  /**
+   * Array of path patterns to exclude from the queue middleware.
+   * Can be exact paths or patterns with wildcards (e.g., '/api/abc', '/api/health/*').
+   * Requests matching these paths will bypass the queue entirely.
+   */
+  exclude?: string[]
 }
 
 /**
@@ -91,12 +98,12 @@ class RequestQueue {
    */
   async enqueue(context: Context, next: Next): Promise<Response> {
     const requestId = context.get('requestId') as string
-    
+
     if (!requestId) {
       console.error(`\n[hono-slow-down] No request-id found, add this middleware before queueMiddleware:\n\nimport { requestId } from 'hono/request-id'\napp.use('*', requestId());\n`)
       throw new Error('Request ID is required for queue middleware')
     }
-    
+
     debug.enqueue('Request %s attempting to join queue (waiting: %d, active: %d/%d)',
       requestId, this.waitingQueue.length, this.limit.activeCount, this.options.concurrency)
 
@@ -242,7 +249,8 @@ class RequestQueue {
  *   queueLimit: 100,     // Max 100 requests waiting
  *   concurrency: 5,      // Process 5 requests at once
  *   timeout: 10000,      // 10 second timeout
- *   onQueueFull: (c) => c.json({ error: 'Server busy' }, 429)
+ *   onQueueFull: (c) => c.json({ error: 'Server busy' }, 429),
+ *   exclude: ['/api/abc', '/api/health/*']  // Exclude specific paths
  * }))
  * ```
  */
@@ -251,13 +259,37 @@ export function queueMiddleware(options: QueueMiddlewareOptions) {
   const queue = new RequestQueue(options)
 
   return async (context: Context, next: Next) => {
+    const requestPath = context.req.path
+
+    if (options.exclude && options.exclude.length > 0) {
+      for (const excludePattern of options.exclude) {
+        if (excludePattern === requestPath) {
+          debug.middleware('Request %s excluded (exact match)', requestPath)
+          return await next()
+        }
+
+        // Check for wildcard pattern match
+        if (excludePattern.includes('*')) {
+          const regexPattern = excludePattern
+            .replace(/[.+?^${}()|[\]\\]/g, '\\$&') // Escape special regex chars except *
+            .replace(/\*/g, '.*') // Convert * to .*
+          const regex = new RegExp(`^${regexPattern}$`)
+
+          if (regex.test(requestPath)) {
+            debug.middleware('Request %s excluded (pattern match: %s)', requestPath, excludePattern)
+            return await next()
+          }
+        }
+      }
+    }
+
     const requestId = context.get('requestId') as string
-    
+
     if (!requestId) {
       console.error(`\n[hono-slow-down] No request-id found, add this middleware before queueMiddleware:\n\nimport { requestId } from 'hono/request-id'\napp.use('*', requestId());\n`)
       throw new Error('Request ID is required for queue middleware')
     }
-    
+
     debug.middleware('Middleware invoked for request %s', requestId)
     return await queue.enqueue(context, next)
   }
