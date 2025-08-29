@@ -1,7 +1,12 @@
 {
   "name": "hono-slow-down",
-  "version": "1.0.4",
-  "main": "src/index.ts",
+  "version": "1.0.6",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "type": "module",
   "repository": {
     "type": "git",
@@ -24,5 +29,9 @@
     "@types/debug": "^4.1.12",
     "tsup": "^8.5.0",
     "typescript": "^5.9.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
   }
 }

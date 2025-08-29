@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { logger } from 'hono/logger'
-import { queueMiddleware } from '.'
+import { queueMiddleware } from 'hono-slow-down'
 import { requestId } from 'hono/request-id'
 
 const app = new Hono()

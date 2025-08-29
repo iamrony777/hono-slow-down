@@ -13,9 +13,14 @@ bun add hono-slow-down
 ```typescript
 import { Hono } from 'hono'
 import { queueMiddleware } from 'hono-slow-down'
+import { requestId } from 'hono/request-id' // built-in middleware, required for queueMiddleware
 
 const app = new Hono()
 
+// Add requestId middleware to generate a unique request ID
+app.use('*', requestId())
+
+// Add queue middleware to slow down the API
 app.use('*', queueMiddleware({
   queueLimit: 100, // Max 100 requests waiting, set to 0 for unlimited
   concurrency: 5, // Process up to 5 requests concurrently
