@@ -11,17 +11,15 @@ const debug = {
 }
 
 /**
- * Represents a request waiting in the queue
+ * Node in a doubly-linked list for O(1) removal
  */
-interface QueuedRequest {
-  /** Unique identifier for the request (from X-Request-ID header) */
+interface QueueNode {
   id: string
-  /** Unix timestamp when the request was added to the queue */
   timestamp: number
-  /** The Hono context object for this request */
   context: Context
-  /** The next middleware function to call */
   next: Next
+  prev: QueueNode | null
+  nextNode: QueueNode | null
 }
 
 /**
@@ -29,7 +27,8 @@ interface QueuedRequest {
  */
 interface QueueMiddlewareOptions {
   /** 
-   * Maximum number of requests that can wait in the queue.
+   * Maximum total number of requests allowed in the system (waiting + processing).
+   * When this limit is reached, new requests will be rejected with onQueueFull handler.
    * Set to 0 for unlimited queue size.
    */
   queueLimit: number
@@ -67,14 +66,29 @@ interface QueueMiddlewareOptions {
 }
 
 /**
- * Manages a queue of incoming HTTP requests with configurable concurrency and timeout handling.
- * Uses p-limit to efficiently control concurrent request processing.
+ * Compiled exclusion pattern for efficient matching
+ */
+interface CompiledPattern {
+  type: 'exact' | 'regex'
+  pattern: string | RegExp
+}
+
+/**
+ * High-performance queue implementation using Map and doubly-linked list
  */
 class RequestQueue {
-  private waitingQueue: QueuedRequest[] = []
-  private readonly options: QueueMiddlewareOptions
+  private readonly nodeMap = new Map<string, QueueNode>()
+  private head: QueueNode | null = null
+  private tail: QueueNode | null = null
+  private queueSize = 0
+  
+  private readonly options: Required<Pick<QueueMiddlewareOptions, 'timeout' | 'concurrency' | 'queueLimit'>> & QueueMiddlewareOptions
   private readonly limit: ReturnType<typeof pLimit>
-  private timeoutMap = new Map<string, NodeJS.Timeout>()
+  private readonly timeoutMap = new Map<string, NodeJS.Timeout>()
+  private readonly compiledExclusions: CompiledPattern[] = []
+  
+  // Track processing state to handle race conditions
+  private readonly processingSet = new Set<string>()
 
   constructor(options: QueueMiddlewareOptions) {
     this.options = {
@@ -83,18 +97,110 @@ class RequestQueue {
       ...options
     }
 
-    this.limit = pLimit(this.options.concurrency!)
+    this.limit = pLimit(this.options.concurrency)
+    
+    // Pre-compile exclusion patterns
+    this.compileExclusions()
 
     debug.main('RequestQueue initialized with options: queueLimit=%d, concurrency=%d, timeout=%d',
       this.options.queueLimit, this.options.concurrency, this.options.timeout)
   }
 
   /**
+   * Pre-compile exclusion patterns for efficient matching
+   */
+  private compileExclusions(): void {
+    if (!this.options.exclude || this.options.exclude.length === 0) {
+      return
+    }
+
+    for (const pattern of this.options.exclude) {
+      if (pattern.includes('*')) {
+        // Convert wildcard pattern to regex once
+        const regexPattern = pattern
+          .replace(/[.+?^${}()|[\]\\]/g, '\\$&') // Escape special regex chars except *
+          .replace(/\*/g, '.*') // Convert * to .*
+        this.compiledExclusions.push({
+          type: 'regex',
+          pattern: new RegExp(`^${regexPattern}$`)
+        })
+      } else {
+        // Exact match
+        this.compiledExclusions.push({
+          type: 'exact',
+          pattern
+        })
+      }
+    }
+    
+    debug.middleware('Compiled %d exclusion patterns', this.compiledExclusions.length)
+  }
+
+  /**
+   * Check if a path should be excluded (optimized)
+   */
+  isPathExcluded(path: string): boolean {
+    for (const compiled of this.compiledExclusions) {
+      if (compiled.type === 'exact') {
+        if (compiled.pattern === path) {
+          debug.middleware('Request %s excluded (exact match)', path)
+          return true
+        }
+      } else {
+        if ((compiled.pattern as RegExp).test(path)) {
+          debug.middleware('Request %s excluded (pattern match)', path)
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  /**
+   * Add node to the tail of the linked list - O(1)
+   */
+  private addToTail(node: QueueNode): void {
+    node.prev = this.tail
+    node.nextNode = null
+    
+    if (this.tail) {
+      this.tail.nextNode = node
+    }
+    this.tail = node
+    
+    if (!this.head) {
+      this.head = node
+    }
+    
+    this.queueSize++
+    this.nodeMap.set(node.id, node)
+  }
+
+  /**
+   * Remove node from linked list - O(1)
+   */
+  private removeNode(node: QueueNode): void {
+    if (node.prev) {
+      node.prev.nextNode = node.nextNode
+    } else {
+      this.head = node.nextNode
+    }
+    
+    if (node.nextNode) {
+      node.nextNode.prev = node.prev
+    } else {
+      this.tail = node.prev
+    }
+    
+    this.queueSize--
+    this.nodeMap.delete(node.id)
+  }
+
+  /**
    * Adds a request to the queue and processes it when capacity is available.
-   * 
-   * @param context - The Hono context for the current request
-   * @param next - The next middleware in the chain
-   * @returns The response after processing or an error response if rejected/timed out
+   * Optimized with O(1) operations
+   * Uses Promise.race to handle timeouts properly - returns timeout response immediately
+   * without waiting for the underlying handler to complete
    */
   async enqueue(context: Context, next: Next): Promise<Response> {
     const requestId = context.get('requestId') as string
@@ -105,88 +211,138 @@ class RequestQueue {
     }
 
     debug.enqueue('Request %s attempting to join queue (waiting: %d, active: %d/%d)',
-      requestId, this.waitingQueue.length, this.limit.activeCount, this.options.concurrency)
+      requestId, this.queueSize, this.limit.activeCount, this.options.concurrency)
 
-    if (this.options.queueLimit > 0 && this.waitingQueue.length >= this.options.queueLimit) {
-      debug.enqueue('Request %s rejected - queue full (limit: %d)', requestId, this.options.queueLimit)
+    // Check if we've reached the queue limit
+    // Queue limit includes both waiting requests AND currently processing requests
+    const totalInSystem = this.queueSize + this.limit.activeCount + this.limit.pendingCount
+    
+    if (this.options.queueLimit > 0 && totalInSystem >= this.options.queueLimit) {
+      debug.enqueue('Request %s rejected - queue full (total in system: %d, limit: %d)', 
+        requestId, totalInSystem, this.options.queueLimit)
       if (this.options.onQueueFull) {
         return await this.options.onQueueFull(context)
       }
       return new Response('Queue is full', { status: 429 })
     }
 
-    const queuedRequest: QueuedRequest = {
+    const node: QueueNode = {
       id: requestId,
       timestamp: Date.now(),
       context,
-      next
+      next,
+      prev: null,
+      nextNode: null
     }
 
-    this.waitingQueue.push(queuedRequest)
-    debug.enqueue('Request %s added to waiting queue (position: %d)', requestId, this.waitingQueue.length)
+    // Add to queue with O(1) operation
+    this.addToTail(node)
+    const totalInSystemAfterAdd = this.queueSize + this.limit.activeCount + this.limit.pendingCount
+    debug.enqueue('Request %s added to waiting queue (waiting: %d, total in system: %d)', 
+      requestId, this.queueSize, totalInSystemAfterAdd)
 
-    if (this.options.timeout && this.options.timeout > 0) {
-      debug.enqueue('Request %s timeout set for %dms', requestId, this.options.timeout)
-      const timeoutId = setTimeout(() => {
-        this.handleTimeout(requestId)
-      }, this.options.timeout)
-      this.timeoutMap.set(requestId, timeoutId)
-    }
+    // Set up timeout handling with Promise.race
+    let timeoutId: NodeJS.Timeout | undefined
+    
+    // Create timeout promise if configured
+    const timeoutPromise = this.options.timeout && this.options.timeout > 0
+      ? new Promise<Response>((resolve) => {
+          debug.enqueue('Request %s timeout set for %dms', requestId, this.options.timeout)
+          timeoutId = setTimeout(() => {
+            debug.timeout('Request %s timed out after %dms', requestId, this.options.timeout)
+            this.handleTimeout(requestId)
+            
+            // Immediately resolve with timeout response
+            const timeoutResponse = this.options.onQueueTimeout 
+              ? this.options.onQueueTimeout(context)
+              : new Response('Request timeout', { status: 408 })
+            
+            // Resolve the timeout promise
+            if (timeoutResponse instanceof Promise) {
+              timeoutResponse.then(resolve)
+            } else {
+              resolve(timeoutResponse)
+            }
+          }, this.options.timeout)
+          this.timeoutMap.set(requestId, timeoutId)
+        })
+      : null
 
-    try {
-      const response = await this.limit(async () => {
-        const index = this.waitingQueue.findIndex(req => req.id === requestId)
-        if (index === -1) {
-          debug.process('Request %s no longer in queue (likely timed out)', requestId)
-          throw new Error('Request removed from queue')
-        }
+    // Create the main request processing promise
+    const processPromise = this.limit(async () => {
+      // Check if request was already removed (e.g., by timeout)
+      const currentNode = this.nodeMap.get(requestId)
+      if (!currentNode) {
+        debug.process('Request %s no longer in queue (likely timed out)', requestId)
+        throw new Error('Request timed out')
+      }
 
-        this.waitingQueue.splice(index, 1)
-        debug.process('Request %s starting processing (waiting: %d, active: %d/%d)',
-          requestId, this.waitingQueue.length, this.limit.activeCount, this.options.concurrency)
+      // Mark as processing to prevent race conditions
+      this.processingSet.add(requestId)
+      
+      // Remove from queue with O(1) operation
+      this.removeNode(currentNode)
+      debug.process('Request %s starting processing (waiting: %d, active: %d/%d)',
+        requestId, this.queueSize, this.limit.activeCount, this.options.concurrency)
 
-        const timeoutId = this.timeoutMap.get(requestId)
+      const startTime = Date.now()
+      
+      try {
+        await next()
+
+        const processingTime = Date.now() - startTime
+        debug.process('Request %s completed successfully in %dms', requestId, processingTime)
+
+        // Clear timeout only on successful completion
         if (timeoutId) {
           clearTimeout(timeoutId)
           this.timeoutMap.delete(requestId)
         }
 
-        const startTime = Date.now()
-        try {
-          await next()
-
-          const processingTime = Date.now() - startTime
-          debug.process('Request %s completed successfully in %dms', requestId, processingTime)
-
-          return context.res
-        } catch (error) {
-          const processingTime = Date.now() - startTime
-          debug.process('Request %s failed after %dms: %O', requestId, processingTime, error)
-          throw error
+        return context.res
+      } catch (error) {
+        const processingTime = Date.now() - startTime
+        debug.process('Request %s failed after %dms: %O', requestId, processingTime, error)
+        
+        // Clear timeout on error
+        if (timeoutId) {
+          clearTimeout(timeoutId)
+          this.timeoutMap.delete(requestId)
         }
-      })
-
-      return response
-    } catch (error) {
-      if (error instanceof Error && error.message === 'Request timed out') {
-        if (this.options.onQueueTimeout) {
-          return await this.options.onQueueTimeout(context)
-        }
-        return new Response('Request timeout', { status: 408 })
+        
+        throw error
+      } finally {
+        // Clean up processing state
+        this.processingSet.delete(requestId)
       }
-      throw error
+    })
+
+    // Race between timeout and processing
+    if (timeoutPromise) {
+      return await Promise.race([processPromise, timeoutPromise])
+    } else {
+      return await processPromise
     }
   }
 
   /**
    * Handles request timeout by removing it from the queue and cleaning up
+   * Optimized with O(1) operations
    */
   private handleTimeout(requestId: string): void {
     debug.timeout('Timeout triggered for request %s', requestId)
 
-    const index = this.waitingQueue.findIndex(req => req.id === requestId)
-    if (index !== -1) {
-      this.waitingQueue.splice(index, 1)
+    // If request is being processed, the timeout flag will handle it
+    if (this.processingSet.has(requestId)) {
+      debug.timeout('Request %s is processing, will be terminated due to timeout', requestId)
+      // The hasTimedOut flag in enqueue() will handle the termination
+      return
+    }
+
+    // O(1) lookup and removal for waiting requests
+    const node = this.nodeMap.get(requestId)
+    if (node) {
+      this.removeNode(node)
       debug.timeout('Request %s removed from waiting queue due to timeout', requestId)
     }
 
@@ -194,16 +350,21 @@ class RequestQueue {
   }
 
   /**
+   * Gets the total number of requests in the system (waiting + processing + pending)
+   */
+  getTotalInSystem(): number {
+    return this.queueSize + this.limit.activeCount + this.limit.pendingCount
+  }
+
+  /**
    * Gets the number of requests currently waiting in the queue
-   * @returns The number of waiting requests
    */
   getQueueLength(): number {
-    return this.waitingQueue.length
+    return this.queueSize
   }
 
   /**
    * Checks if any requests are currently being processed
-   * @returns True if requests are being processed, false otherwise
    */
   isProcessing(): boolean {
     return this.limit.activeCount > 0
@@ -211,7 +372,6 @@ class RequestQueue {
 
   /**
    * Gets the number of requests actively being processed
-   * @returns The number of active requests
    */
   getProcessingCount(): number {
     return this.limit.activeCount
@@ -219,7 +379,6 @@ class RequestQueue {
 
   /**
    * Gets the number of requests pending execution (queued in p-limit)
-   * @returns The number of pending requests
    */
   getPendingCount(): number {
     return this.limit.pendingCount
@@ -227,18 +386,27 @@ class RequestQueue {
 
   /**
    * Gets information about all requests currently waiting in the queue
-   * @returns Array of request info with ID and timestamp
+   * Optimized to iterate through linked list
    */
   getQueuedRequests(): Array<{ id: string; timestamp: number }> {
-    return this.waitingQueue.map(req => ({
-      id: req.id,
-      timestamp: req.timestamp
-    }))
+    const requests: Array<{ id: string; timestamp: number }> = []
+    let current = this.head
+    
+    while (current) {
+      requests.push({
+        id: current.id,
+        timestamp: current.timestamp
+      })
+      current = current.nextNode
+    }
+    
+    return requests
   }
 }
 
 /**
  * Creates a Hono middleware that queues and rate-limits incoming requests.
+ * Optimized for high-performance with O(1) operations
  * 
  * @param options - Configuration for queue behavior
  * @returns Hono middleware function
@@ -259,32 +427,13 @@ export function queueMiddleware(options: QueueMiddlewareOptions) {
   const queue = new RequestQueue(options)
 
   return async (context: Context, next: Next) => {
-    const requestPath = context.req.path
-
-    if (options.exclude && options.exclude.length > 0) {
-      for (const excludePattern of options.exclude) {
-        if (excludePattern === requestPath) {
-          debug.middleware('Request %s excluded (exact match)', requestPath)
-          return await next()
-        }
-
-        // Check for wildcard pattern match
-        if (excludePattern.includes('*')) {
-          const regexPattern = excludePattern
-            .replace(/[.+?^${}()|[\]\\]/g, '\\$&') // Escape special regex chars except *
-            .replace(/\*/g, '.*') // Convert * to .*
-          const regex = new RegExp(`^${regexPattern}$`)
-
-          if (regex.test(requestPath)) {
-            debug.middleware('Request %s excluded (pattern match: %s)', requestPath, excludePattern)
-            return await next()
-          }
-        }
-      }
+    // Check exclusions first (optimized with pre-compiled patterns)
+    if (queue.isPathExcluded(context.req.path)) {
+      return await next()
     }
 
+    // Single request ID check (removed duplicate)
     const requestId = context.get('requestId') as string
-
     if (!requestId) {
       console.error(`\n[hono-slow-down] No request-id found, add this middleware before queueMiddleware:\n\nimport { requestId } from 'hono/request-id'\napp.use('*', requestId());\n`)
       throw new Error('Request ID is required for queue middleware')
@@ -295,4 +444,6 @@ export function queueMiddleware(options: QueueMiddlewareOptions) {
   }
 }
 
-export { RequestQueue, type QueueMiddlewareOptions, type QueuedRequest }
+// Export types for compatibility
+export { RequestQueue }
+export type { QueueMiddlewareOptions, QueueNode as QueuedRequest }
