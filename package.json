@@ -1,5 +1,17 @@
 {
   "name": "hono-slow-down",
+  "description": "Hono middleware to slow down your API responses without blocking them",
+  "keywords": [
+    "hono",
+    "middleware",
+    "slow-down",
+    "queue",
+    "rate-limiter",
+    "hono-slow-down",
+    "hono-rate-limiter",
+    "iamrony777"
+  ],
+  "readme": "https://github.com/iamrony777/hono-slow-down/blob/main/README.md",
   "version": "1.0.9",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
