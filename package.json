@@ -12,7 +12,7 @@
     "iamrony777"
   ],
   "readme": "https://github.com/iamrony777/hono-slow-down/blob/main/README.md",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
